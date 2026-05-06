@@ -1,0 +1,16 @@
+# Data and Local results (Recursive ignore)
+data/
+results/
+preprocessed_data/
+temp/
+
+# Python artifacts
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Binaries & Weights
+*.ckpt
+*.onnx
+*.engine
+*.pt

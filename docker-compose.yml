@@ -1,0 +1,21 @@
+services:
+  cv-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
+    image: smart-cv-layers:dev
+    container_name: smart_cv_dev
+    shm_size: '8gb'
+    volumes:
+      - .:/app
+    working_dir: /app
+    stdin_open: true 
+    tty: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

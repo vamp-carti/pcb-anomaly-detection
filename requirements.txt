@@ -1,0 +1,31 @@
+# Core CV & Data
+numpy<2.0.0
+opencv-contrib-python
+imutils
+imgaug
+kornia
+albumentations<1.4.0
+scikit-learn
+pandas
+matplotlib<3.8.0
+cupy==13.6.0
+
+# Deep Learning Frameworks
+torch>=2.0.0
+torchvision
+lightning>=2.1.0
+pytorch-lightning>=2.1.0
+
+# Anomaly Detection & Special Architectures
+anomalib==1.1.0
+timm
+einops
+FrEIA
+open-clip-torch
+onnx
+onnxscript
+
+# Utilities
+requests
+tqdm
+

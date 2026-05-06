@@ -1,0 +1,16 @@
+# Exclude data and results from the Docker build context
+data/
+results/
+preprocessed_data/
+temp/
+
+# Exclude git and python noise
+.git
+__pycache__
+*.pyc
+
+# Exclude large weights (Already in results/, but good to be safe)
+*.ckpt
+*.onnx
+*.engine
+*.pt
