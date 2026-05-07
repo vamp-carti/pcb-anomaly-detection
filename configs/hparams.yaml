@@ -1,0 +1,5 @@
+backbone: resnet18
+pre_trained: true
+flow_steps: 8
+conv3x3_only: false
+hidden_ratio: 1.0
