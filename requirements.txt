@@ -1,6 +1,6 @@
 # Core CV & Data
 numpy<2.0.0
-opencv-contrib-python
+opencv-contrib-python-headless
 imutils
 imgaug
 kornia

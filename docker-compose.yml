@@ -9,6 +9,9 @@ services:
     shm_size: '8gb'
     volumes:
       - .:/app
+      - ${SSH_AUTH_SOCK}:/run/ssh-agent # Maps your host's SSH socket
+    environment:
+      - SSH_AUTH_SOCK=/run/ssh-agent    # Tells Git where to find the socket
     working_dir: /app
     stdin_open: true 
     tty: true
