@@ -30,3 +30,7 @@ target_link_libraries(tensorrt cuda_kernels ${OpenCV_LIBS} ${NVINFER_LIB} cuda c
 
 add_executable(pre preprocess.cpp)
 target_link_libraries(pre ${OpenCV_LIBS} ${CUDA_LIBRARIES} ${NVINFER})
+
+add_executable(engine engine.cpp)
+target_include_directories(engine PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES} ${NVINFER_INCLUDE_DIR})
+target_link_libraries(engine cuda_kernels ${OpenCV_LIBS} ${NVINFER_LIB} cuda cudart)
