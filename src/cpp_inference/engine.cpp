@@ -1,3 +1,4 @@
+#include <atomic>
 #include <opencv2/opencv.hpp> 
 #include <opencv2/cudawarping.hpp> 
 #include <opencv2/cudaarithm.hpp> 
@@ -18,6 +19,8 @@
 #include <chrono>
 #include <sstream>
 #include <iomanip>
+#include <algorithm>
+#include <numeric>
 
 namespace fs = std::filesystem; 
 
@@ -63,6 +66,7 @@ struct FrameData {
     cv::Mat frame; 
     std::string filename; 
     int label; // 0 = Good, 1 = Anomaly
+    double io_read_ms; // Extracted performance tracker item
 }; 
 
 class FrameRingBuffer { 
@@ -94,11 +98,21 @@ public:
     void set_finished() { 
         std::unique_lock<std::mutex> lock(mutex_); 
         finished_ = true; 
-        cv_not_empty_.notify_all(); 
+        cv_not_empty_.notify_all();
+        cv_not_full_.notify_all(); 
     } 
 }; 
 
-// --- EXTERNAL SEPARATED CUDA COMPILATION UNIT INTERFACES --- 
+// Global telemetry collection metrics for final report generation
+std::mutex g_metrics_mutex;
+std::vector<double> g_io_read_lats;
+std::vector<double> g_preprocess_lats;
+std::vector<double> g_h2d_lats;
+std::vector<double> g_inference_lats;
+std::vector<double> g_postprocess_lats;
+std::vector<double> g_d2h_lats;
+
+// --- EXTERN COMPILATION INTERFACES --- 
 extern "C" void launch_hwc_to_chw_interface(const uint8_t* src_data, float* dst_device,  
                                             int width, int height, int src_step,  
                                             cudaStream_t stream); 
@@ -114,25 +128,42 @@ extern "C" void launch_postprocess_mask_amp(const float* src_device, float* dst_
                                             float pin_zone_bias, float osc_bias, 
                                             cudaStream_t stream); 
 
-// --- SEGREGATED INPUT MULTI-CLASS PRODUCER WORKER --- 
-// ─── CHANGER 1: MODIFIED MULTI-THREADED PRODUCER WORKER ───
+// --- MULTI-THREADED PRODUCER WORKER WITH IO METRICS PROFILING --- 
 void producer_file_reader(std::vector<std::pair<std::string, int>>::const_iterator start, 
                           std::vector<std::pair<std::string, int>>::const_iterator end, 
-                          FrameRingBuffer& ring_buffer) { 
+                          FrameRingBuffer& ring_buffer,
+                          std::atomic<int>& active_workers) {
+    std::vector<double> local_io_lats;
+    local_io_lats.reserve(std::distance(start, end));
+
     for (auto it = start; it != end; ++it) { 
+        auto t_io_start = std::chrono::high_resolution_clock::now();
         cv::Mat frame = cv::imread(it->first); 
+        auto t_io_end = std::chrono::high_resolution_clock::now();
+        
         if (frame.empty()) continue; 
-         
+        
+        double io_ms = std::chrono::duration<double, std::milli>(t_io_end - t_io_start).count();
+        local_io_lats.push_back(io_ms);
+
         FrameData data; 
         data.frame = frame; 
         data.filename = fs::path(it->first).filename().string(); 
-        data.label = it->second; // Fixed: Label is safely packed
+        data.label = it->second; 
+        data.io_read_ms = io_ms;
          
         ring_buffer.push(std::move(data)); 
-    } 
+    }
+
+    // Flush local thread metrics to master array seamlessly
+    std::lock_guard<std::mutex> lock(g_metrics_mutex);
+    g_io_read_lats.insert(g_io_read_lats.end(), local_io_lats.begin(), local_io_lats.end());
+
+    if (--active_workers == 0) {
+        ring_buffer.set_finished();
+    }     
 }
 
-// Helper function to return system ISO timestamp strings
 std::string get_iso_timestamp() {
     auto now = std::chrono::system_clock::now();
     auto in_time_t = std::chrono::system_clock::to_time_t(now);
@@ -141,16 +172,68 @@ std::string get_iso_timestamp() {
     return ss.str();
 }
 
+// --- TELEMETRY BATCH WRITER LOGGER CLASS ---
+class TelemetryLogger {
+private:
+    std::string log_path_;
+    std::vector<std::string> buffer_;
+    size_t batch_threshold_ = 50;
+
+public:
+    TelemetryLogger(const std::string& path) : log_path_(path) {
+        buffer_.reserve(batch_threshold_);
+    }
+
+    void log_event(const std::string& board_id, const std::string& status, const std::string& profile,
+                   double h2d, double exec, double d2h, double vram_free) {
+        std::stringstream ss;
+        ss << "{\"timestamp\":\"" << get_iso_timestamp() << "\","
+           << "\"board_id\":\"" << board_id << "\","
+           << "\"status\":\"" << status << "\",";
+        
+        // If it's a mechanical error, inject the ME01 tracking code into the json record
+        if (status == "MECHANICAL_ERROR") {
+            ss << "\"error_code\":\"ME01\",";
+        }
+
+        ss << "\"h2d_ms\":" << std::fixed << std::setprecision(4) << h2d << ","
+           << "\"exec_ms\":" << exec << ","
+           << "\"d2h_ms\":" << d2h << ","
+           << "\"profile\":\"" << profile << "\","
+           << "\"vram_free_mb\":" << std::fixed << std::setprecision(2) << vram_free << "}";
+        
+        buffer_.push_back(ss.str());
+
+        if (buffer_.size() >= batch_threshold_) {
+            flush();
+        }
+    }
+
+    void flush() {
+        if (buffer_.empty()) return;
+        std::ofstream log_file(log_path_, std::ios::app);
+        if (log_file.is_open()) {
+            for (const auto& line : buffer_) {
+                log_file << line << "\n";
+            }
+            log_file.close();
+        }
+        buffer_.clear();
+    }
+
+    ~TelemetryLogger() {
+        flush();
+    }
+};
+
 int main() { 
-    // Target Segregated Image Paths
-    std::string good_dir = "/app/data/images/good/*.png"; 
-    std::string anomaly_dir = "/app/data/images/anomaly/*.png"; 
-    std::string engine_path = "/app/results/pcb_fastflow_fp16.engine"; 
+    std::string good_dir = "/app/temp/images/good/*.png"; 
+    std::string anomaly_dir = "/app/temp/images/anomaly/*.png"; 
+    std::string engine_path = "/app/temp/pcb.engine"; 
     std::string telemetry_log_path = "/app/temp/telemetry_log.json";
 
-    // Dynamic Industrial Profile Configuration Layer
     IndustrialProfile current_profile = IndustrialProfile::BALANCED;
-    float threshold = -0.2600f; // Default (BALANCED)
+    float threshold = -0.2500f; 
     std::string profile_str = "BALANCED";
 
     if (current_profile == IndustrialProfile::SAFETY) {
@@ -161,7 +244,6 @@ int main() {
         profile_str = "UPTIME";
     }
 
-    // --- TENSORRT ENGINE INITIALIZATION --- 
     std::ifstream file(engine_path, std::ios::binary); 
     if (!file.good()) { std::cerr << "Engine file verification failed!" << std::endl; return -1; } 
      
@@ -175,52 +257,68 @@ int main() {
     nvinfer1::ICudaEngine* engine = runtime->deserializeCudaEngine(engine_data.data(), size); 
     nvinfer1::IExecutionContext* context = engine->createExecutionContext(); 
 
-    // --- ALLOCATE PERSISTENT ENGINES & STAGING BUFFERS (EXACTLY ONCE) --- 
-    void* buffers[2]; 
-    cudaMalloc(&buffers[0], INPUT_SIZE);  
-    cudaMalloc(&buffers[1], OUTPUT_SIZE); 
+    // DOUBLE BUFFER STRUCTURE INITIALIZATION
+    void* buffers[2][2]; 
+    cudaMalloc(&buffers[0][0], INPUT_SIZE);  
+    cudaMalloc(&buffers[0][1], OUTPUT_SIZE); 
+    cudaMalloc(&buffers[1][0], INPUT_SIZE);  
+    cudaMalloc(&buffers[1][1], OUTPUT_SIZE); 
 
-    float* h_output_pinned = nullptr; 
-    cudaHostAlloc(&h_output_pinned, OUTPUT_SIZE, cudaHostAllocPortable); 
-    cv::Mat h_anomaly(INPUT_H, INPUT_W, CV_32FC1, h_output_pinned); 
+    float* h_output_pinned[2] = {nullptr, nullptr}; 
+    cudaHostAlloc(&h_output_pinned[0], OUTPUT_SIZE, cudaHostAllocPortable); 
+    cudaHostAlloc(&h_output_pinned[1], OUTPUT_SIZE, cudaHostAllocPortable); 
+    
+    cv::Mat h_anomaly[2];
+    h_anomaly[0] = cv::Mat(INPUT_H, INPUT_W, CV_32FC1, h_output_pinned[0]);
+    h_anomaly[1] = cv::Mat(INPUT_H, INPUT_W, CV_32FC1, h_output_pinned[1]);
 
-    // --- PRE-ALLOCATED STORAGE ARENA ON VRAM (ZERO RUNTIME CHURN) --- 
-    cv::cuda::GpuMat d_frame;  
-    cv::cuda::GpuMat d_frame_rgba;
-    cv::cuda::GpuMat d_warped_320(320, 320, CV_8UC4);   
-    cv::cuda::GpuMat d_rotated_320(320, 320, CV_8UC4);  
-    cv::cuda::GpuMat d_final_padded;
-    cv::cuda::GpuMat d_final_256(INPUT_H, INPUT_W, CV_8UC3); 
+    cv::cuda::GpuMat d_frame[2];  
+    cv::cuda::GpuMat d_frame_rgba[2];
+    cv::cuda::GpuMat d_warped_320[2]  = { cv::cuda::GpuMat(320, 320, CV_8UC4), cv::cuda::GpuMat(320, 320, CV_8UC4) };   
+    cv::cuda::GpuMat d_rotated_320[2] = { cv::cuda::GpuMat(320, 320, CV_8UC4), cv::cuda::GpuMat(320, 320, CV_8UC4) };  
+    cv::cuda::GpuMat d_final_padded[2];
+    cv::cuda::GpuMat d_final_256[2]   = { cv::cuda::GpuMat(INPUT_H, INPUT_W, CV_8UC3), cv::cuda::GpuMat(INPUT_H, INPUT_W, CV_8UC3) }; 
 
-    std::vector<cv::cuda::GpuMat> bgra_channels; 
-    std::vector<cv::cuda::GpuMat> bgr_channels(3);
+    std::vector<cv::cuda::GpuMat> bgra_channels[2]; 
+    std::vector<cv::cuda::GpuMat> bgr_channels[2] = { std::vector<cv::cuda::GpuMat>(3), std::vector<cv::cuda::GpuMat>(3) };
 
-    cv::cuda::GpuMat d_anomaly_map_blurred(INPUT_H, INPUT_W, CV_32FC1); 
-    cv::cuda::GpuMat d_anomaly_map_final(INPUT_H, INPUT_W, CV_32FC1); 
+    cv::cuda::GpuMat d_anomaly_map_blurred[2] = { cv::cuda::GpuMat(INPUT_H, INPUT_W, CV_32FC1), cv::cuda::GpuMat(INPUT_H, INPUT_W, CV_32FC1) }; 
+    cv::cuda::GpuMat d_anomaly_map_final[2]   = { cv::cuda::GpuMat(INPUT_H, INPUT_W, CV_32FC1), cv::cuda::GpuMat(INPUT_H, INPUT_W, CV_32FC1) }; 
 
-    cv::cuda::GpuMat d_hsv, d_mask, d_proj_cols;
-    cv::Mat h_proj_cols;
+    cv::cuda::GpuMat d_hsv[2], d_mask[2], d_proj_cols[2];
+    cv::Mat h_proj_cols[2];
 
-    cv::cuda::Stream stream; 
-    cudaStream_t raw_stream = cv::cuda::StreamAccessor::getStream(stream); 
+    cv::cuda::Stream stream[2]; 
+    cudaStream_t raw_stream[2];
+    raw_stream[0] = cv::cuda::StreamAccessor::getStream(stream[0]);
+    raw_stream[1] = cv::cuda::StreamAccessor::getStream(stream[1]);
 
     cv::Ptr<cv::cuda::Filter> gaussian_filter = cv::cuda::createGaussianFilter(CV_32FC1, CV_32FC1, cv::Size(5, 5), 0); 
 
-    // ======================================================================== 
-    // MANDATORY GPU WARMUP ENGINE TENSORS
-    // ======================================================================== 
+    // --- TRACKING PARAMETERS FOR IN-FLIGHT TIMING INTERLOCKS ---
+    struct InFlightMeta {
+        std::string filename;
+        int label;
+        double io_read_ms;
+        double preprocess_ms;
+        double h2d_ms;
+        double inference_ms;
+        double postprocess_ms;
+    } inflight_meta[2];
+
     std::cout << "🔥 Calibrating CUDA Streams & Warming up GPU (20 Tensors)..." << std::endl;
-    cudaMemsetAsync(buffers[0], 0, INPUT_SIZE, raw_stream);
-    for (int w = 0; w < 20; ++w) {
-        context->enqueueV2(buffers, raw_stream, nullptr);
+    cudaMemsetAsync(buffers[0][0], 0, INPUT_SIZE, raw_stream[0]);
+    cudaMemsetAsync(buffers[1][0], 0, INPUT_SIZE, raw_stream[1]);
+    for (int w = 0; w < 10; ++w) {
+        context->enqueueV2(buffers[0], raw_stream[0], nullptr);
+        context->enqueueV2(buffers[1], raw_stream[1], nullptr);
     }
-    cudaStreamSynchronize(raw_stream);
+    cudaStreamSynchronize(raw_stream[0]);
+    cudaStreamSynchronize(raw_stream[1]);
     std::cout << "✅ Warmup Complete. GPU Stable. Handshake Code: " << static_cast<int>(current_profile) << std::endl;
 
-    // Open Telemetry Appender Log File
-    std::ofstream telemetry_log(telemetry_log_path, std::ios::app);
+    TelemetryLogger logger(telemetry_log_path);
 
-    // Gather Segregated File Arrays
     std::vector<std::string> good_paths, anomaly_paths; 
     cv::glob(good_dir, good_paths); 
     cv::glob(anomaly_dir, anomaly_paths); 
@@ -230,29 +328,20 @@ int main() {
         return -1; 
     } 
 
-    // Statistical Accuracy/Confusion Matrix Trackers
     int true_positives = 0, false_positives = 0;
     int true_negatives = 0, false_negatives = 0;
     int total_processed = 0;
 
-    // Latency Telemetry Metrics Buffers (Accumulators for reporting)
-    double total_preprocess_ms = 0.0, total_h2d_ms = 0.0;
-    double total_inference_ms = 0.0, total_postprocess_ms = 0.0;
-    double total_d2h_ms = 0.0;
-
-    // Spin up Asynchronous Pipeline Framework 
-    // ─── CHANGER 2: DEPLOY 10 PARALLEL I/O WORKER THREADS ───
-    // ─── FIXED PARALLEL PRODUCER POOL INITIALIZATION ───
-    FrameRingBuffer ring_buffer; 
+    FrameRingBuffer ring_buffer;
     constexpr int NUM_WORKERS = 10;
     std::vector<std::thread> producer_pool;
     producer_pool.reserve(NUM_WORKERS);
 
+    std::atomic<int> active_workers(NUM_WORKERS);
+
     size_t total_files = good_paths.size() + anomaly_paths.size();
-    // Pair each image string path explicitly with its correct label (0 = Good, 1 = Anomaly)
     std::vector<std::pair<std::string, int>> all_paths;
     all_paths.reserve(total_files);
-    
     for (const auto& p : good_paths)    all_paths.emplace_back(p, 0);
     for (const auto& p : anomaly_paths) all_paths.emplace_back(p, 1);
 
@@ -266,20 +355,25 @@ int main() {
         auto current_end = current_start + current_chunk;
 
         if (current_start != current_end) {
-            producer_pool.emplace_back(producer_file_reader, current_start, current_end, std::ref(ring_buffer));
+            producer_pool.emplace_back(producer_file_reader, current_start, current_end, std::ref(ring_buffer), std::ref(active_workers));
+        } else {
+            --active_workers;
         }
         current_start = current_end;
     }
 
+    std::cout << "DEBUG: Entering Main Pipeline Loop. Files in system: " << total_files << std::endl;
     FrameData job; 
     auto pipeline_start_time = std::chrono::high_resolution_clock::now();
 
+    int idx = 0; 
+    bool first_iterations[2] = {true, true}; 
+
     // --- MAIN ENGINE PIPELINE EXECUTION LOOP --- 
     while (ring_buffer.pop(job)) { 
-         
+        
         auto t_pre_start = std::chrono::high_resolution_clock::now();
 
-        // --- ASYNC CPU PRE-PROCESSING CORNER EXTRACTIONS --- 
         cv::Mat hsv, mask; 
         cv::cvtColor(job.frame, hsv, cv::COLOR_BGR2HSV); 
         cv::inRange(hsv, cv::Scalar(90, 50, 50), cv::Scalar(135, 255, 255), mask); 
@@ -288,7 +382,10 @@ int main() {
 
         std::vector<std::vector<cv::Point>> contours; 
         cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE); 
-        if (contours.empty()) continue; 
+        if (contours.empty()) {
+            std::cout << "DEBUG: [SKIP] No contours found for: " << job.filename << std::endl;
+            continue; 
+        }
 
         auto largest = *std::max_element(contours.begin(), contours.end(),  
             [](const std::vector<cv::Point>& a, const std::vector<cv::Point>& b) {  
@@ -296,6 +393,42 @@ int main() {
             }); 
 
         cv::RotatedRect rect = cv::minAreaRect(largest); 
+        
+        // HIGH-SPEED CPU EARLY REJECT GATEWAY (METRIC CALIBRATION INTERCEPT)
+        // ========================================================================
+        float w = rect.size.width;
+        float h = rect.size.height;
+        
+        // Handle potential zero division safety checks gracefully
+        if (w == 0 || h == 0) {
+            std::cout << "⚠️ [" << job.filename << "] INVALID GEOMETRY ENCOUNTERED -> REJECTING" << std::endl;
+            continue;
+        }
+
+        double calc_ar = std::max(w, h) / std::min(w, h);
+        double calc_scale = w * h;
+
+        // Apply your tight statistical calibration threshold cuts
+        if (calc_ar < 2.00 || calc_ar > 2.50 || calc_scale < 300000.0 || calc_scale > 450000.0) {
+            std::cout << "❌ [" << job.filename << "] EARLY REJECT [ME01]: Scale: " << int(calc_scale) << " | AR: " << calc_ar << std::endl;
+            
+            // 1. Establish directory path and dump the raw frame safely to storage
+            std::string err_dir = "/app/temp/MECHANICAL_ERROR/";
+            fs::create_directories(err_dir);
+            cv::imwrite(err_dir + "ERR_ME01_" + job.filename, job.frame);
+
+            // 2. Sample VRAM footprint profile info for telemetry parity alignment
+            size_t free_mem = 0, total_mem = 0;
+            cudaMemGetInfo(&free_mem, &total_mem);
+            double vram_free_mb = static_cast<double>(free_mem) / (1024.0 * 1024.0);
+
+            // 3. Document event signature directly to the json ledger with 0ms hardware latencies
+            logger.log_event(job.filename, "MECHANICAL_ERROR", profile_str, 0.0, 0.0, 0.0, vram_free_mb);
+            
+            // 4. Dodge every asynchronous GPU enqueue register allocation step entirely
+            continue;
+        }
+        
         cv::Point2f pts[4]; 
         rect.points(pts); 
 
@@ -312,6 +445,11 @@ int main() {
         float d01 = cv::norm(src_pts[0] - src_pts[1]); 
         float d03 = cv::norm(src_pts[0] - src_pts[3]); 
         float board_w, board_h; 
+
+        if (d01 == 0 || d03 == 0) {
+            std::cout << "DEBUG: [SKIP] Invalid norm dimension for: " << job.filename << std::endl;
+            continue;
+        }
 
         if (d03 > d01) { 
             std::rotate(src_pts.begin(), src_pts.begin() + 1, src_pts.end()); 
@@ -338,46 +476,81 @@ int main() {
 
         cv::Mat M = cv::getPerspectiveTransform(src_pts, dst_pts); 
 
-        // --- ASYNC OVERLAPPED GPU PIPELINE --- 
-        d_frame.upload(job.frame, stream); 
+        // ========================================================================
+        // PING-PONG SLOT SYNC POINT & ACCUMULATION PROFILE REGISTRATION
+        // ========================================================================
+        if (!first_iterations[idx]) {
+            auto t_d2h_start = std::chrono::high_resolution_clock::now();
+            stream[idx].waitForCompletion();
+            auto t_d2h_end = std::chrono::high_resolution_clock::now();
+            double d2h_ms = std::chrono::duration<double, std::milli>(t_d2h_end - t_d2h_start).count();
 
-        cv::cuda::cvtColor(d_frame, d_frame_rgba, cv::COLOR_BGR2BGRA, 0, stream); 
+            double max_val; 
+            cv::minMaxLoc(h_anomaly[idx], nullptr, &max_val); 
 
-        // STAGE 1: Perspective Warp 
-        cv::cuda::warpPerspective(d_frame_rgba, d_warped_320, M, cv::Size(320, 320), 
-                                  cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0,0,0,0), stream); 
+            bool predicted_anomaly = (max_val > threshold);
+            std::string status_str = predicted_anomaly ? "FAIL" : "PASS";
 
-        // STAGE 2: Lossless 180-Degree Flip Check
+            if (inflight_meta[idx].label == 1) { 
+                if (predicted_anomaly) true_positives++;
+                else false_negatives++;
+            } else { 
+                if (predicted_anomaly) false_positives++;
+                else true_negatives++;
+            }
+            total_processed++;
+
+            // Global Metrics Preservation Section
+            {
+                std::lock_guard<std::mutex> lock(g_metrics_mutex);
+                g_preprocess_lats.push_back(inflight_meta[idx].preprocess_ms);
+                g_h2d_lats.push_back(inflight_meta[idx].h2d_ms);
+                g_inference_lats.push_back(inflight_meta[idx].inference_ms);
+                g_postprocess_lats.push_back(inflight_meta[idx].postprocess_ms);
+                g_d2h_lats.push_back(d2h_ms);
+            }
+
+            size_t free_mem = 0, total_mem = 0;
+            cudaMemGetInfo(&free_mem, &total_mem);
+            double vram_free_mb = static_cast<double>(free_mem) / (1024.0 * 1024.0);
+
+            logger.log_event(inflight_meta[idx].filename, status_str, profile_str, 
+                             inflight_meta[idx].h2d_ms, inflight_meta[idx].inference_ms, d2h_ms, vram_free_mb);
+        }
+
+        // --- ENQUEUE ASYNC STAGES ON STREAM[IDX] --- 
+        d_frame[idx].upload(job.frame, stream[idx]); 
+        cv::cuda::cvtColor(d_frame[idx], d_frame_rgba[idx], cv::COLOR_BGR2BGRA, 0, stream[idx]); 
+
+        cv::cuda::warpPerspective(d_frame_rgba[idx], d_warped_320[idx], M, cv::Size(320, 320), 
+                                  cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0,0,0,0), stream[idx]); 
+
         if (do_rotate) { 
-            cv::cuda::flip(d_warped_320, d_warped_320, -1, stream); 
+            cv::cuda::flip(d_warped_320[idx], d_warped_320[idx], -1, stream[idx]); 
         } 
 
-        // STAGE 3: Lossless 90-Degree CCW Transpose and Flip
-        cv::cuda::transpose(d_warped_320, d_rotated_320, stream); 
-        cv::cuda::flip(d_rotated_320, d_rotated_320, 0, stream);  
+        cv::cuda::transpose(d_warped_320[idx], d_rotated_320[idx], stream[idx]); 
+        cv::cuda::flip(d_rotated_320[idx], d_rotated_320[idx], 0, stream[idx]);  
 
-        // STAGE 4: Window Crop 
         cv::Rect roi_box(32, 32, INPUT_W, INPUT_H); 
-        d_final_padded = d_rotated_320(roi_box);  
+        d_final_padded[idx] = d_rotated_320[idx](roi_box);  
 
-        // STAGE 5: Channel Split & Remerge back into CV_8UC3
-        cv::cuda::split(d_final_padded, bgra_channels, stream);  
-        bgr_channels[0] = bgra_channels[0]; 
-        bgr_channels[1] = bgra_channels[1]; 
-        bgr_channels[2] = bgra_channels[2]; 
-        cv::cuda::merge(bgr_channels, d_final_256, stream); 
+        cv::cuda::split(d_final_padded[idx], bgra_channels[idx], stream[idx]);  
+        bgr_channels[idx][0] = bgra_channels[idx][0]; 
+        bgr_channels[idx][1] = bgra_channels[idx][1]; 
+        bgr_channels[idx][2] = bgra_channels[idx][2]; 
+        cv::cuda::merge(bgr_channels[idx], d_final_256[idx], stream[idx]); 
 
-        // STAGE 5.5: PRE-INFERENCE 1D EDGE EXTRACTION
-        cv::cuda::cvtColor(d_final_256, d_hsv, cv::COLOR_BGR2HSV, 0, stream); 
-        cv::cuda::inRange(d_hsv, cv::Scalar(90, 50, 50), cv::Scalar(135, 255, 255), d_mask, stream); 
-        cv::cuda::reduce(d_mask, d_proj_cols, 0, cv::REDUCE_SUM, CV_32S, stream); 
+        cv::cuda::cvtColor(d_final_256[idx], d_hsv[idx], cv::COLOR_BGR2HSV, 0, stream[idx]); 
+        cv::cuda::inRange(d_hsv[idx], cv::Scalar(90, 50, 50), cv::Scalar(135, 255, 255), d_mask[idx], stream[idx]); 
+        cv::cuda::reduce(d_mask[idx], d_proj_cols[idx], 0, cv::REDUCE_SUM, CV_32S, stream[idx]); 
          
-        d_proj_cols.download(h_proj_cols, stream); 
-        stream.waitForCompletion(); // Sync point 1
+        d_proj_cols[idx].download(h_proj_cols[idx], stream[idx]); 
+        stream[idx].waitForCompletion(); // Local 1D Edge dependency sync barrier
 
         int detected_l_wall = -1; 
         int detected_r_wall = -1; 
-        const int* proj_ptr = h_proj_cols.ptr<int>(); 
+        const int* proj_ptr = h_proj_cols[idx].ptr<int>(); 
 
         for (int c = 0; c < INPUT_W; ++c) { 
             if (proj_ptr[c] > 0) { 
@@ -398,137 +571,133 @@ int main() {
         auto t_pre_end = std::chrono::high_resolution_clock::now();
         double preprocess_ms = std::chrono::duration<double, std::milli>(t_pre_end - t_pre_start).count();
 
-        // --- STAGED LATENCY BENCHMARKING (INFERENCE & TRANSFERS) ---
+        // --- ASYNC HIGH-PERFORMANCE INFERENCE OVERLAP ENQUEUING ---
         auto t_h2d_start = std::chrono::high_resolution_clock::now();
-        // STAGE 6: Interleaved-to-Planar Conversion (Custom HWC->CHW Kernel) 
-        launch_hwc_to_chw_interface(d_final_256.data, static_cast<float*>(buffers[0]),  
-                                    d_final_256.cols, d_final_256.rows, d_final_256.step,  
-                                    raw_stream); 
-        cudaStreamSynchronize(raw_stream);
+        launch_hwc_to_chw_interface(d_final_256[idx].data, static_cast<float*>(buffers[idx][0]),  
+                                    d_final_256[idx].cols, d_final_256[idx].rows, d_final_256[idx].step,  
+                                    raw_stream[idx]); 
         auto t_h2d_end = std::chrono::high_resolution_clock::now();
         double h2d_ms = std::chrono::duration<double, std::milli>(t_h2d_end - t_h2d_start).count();
 
-        auto t_infer_start = std::chrono::high_resolution_clock::now();
-        // STAGE 7: Execute Engine Model Asynchronous Inference 
-        context->enqueueV2(buffers, raw_stream, nullptr); 
-        cudaStreamSynchronize(raw_stream);
-        auto t_infer_end = std::chrono::high_resolution_clock::now();
-        double inference_ms = std::chrono::duration<double, std::milli>(t_infer_end - t_infer_start).count();
+        auto t_inf_start = std::chrono::high_resolution_clock::now();
+        context->enqueueV2(buffers[idx], raw_stream[idx], nullptr); 
+        auto t_inf_end = std::chrono::high_resolution_clock::now();
+        double inference_ms = std::chrono::duration<double, std::milli>(t_inf_end - t_inf_start).count();
 
         auto t_post_start = std::chrono::high_resolution_clock::now();
-        // STAGE 8: GPU Spatial Smoothing 
-        gaussian_filter->apply(cv::cuda::GpuMat(INPUT_H, INPUT_W, CV_32FC1, buffers[1]), d_anomaly_map_blurred, stream); 
+        gaussian_filter->apply(cv::cuda::GpuMat(INPUT_H, INPUT_W, CV_32FC1, buffers[idx][1]), d_anomaly_map_blurred[idx], stream[idx]); 
         
-        // STAGE 9: Unified Structural Mask Pass + Regional Overrides 
         launch_postprocess_mask_amp( 
-            reinterpret_cast<float*>(d_anomaly_map_blurred.data), 
-            reinterpret_cast<float*>(d_anomaly_map_final.data), 
+            reinterpret_cast<float*>(d_anomaly_map_blurred[idx].data), 
+            reinterpret_cast<float*>(d_anomaly_map_final[idx].data), 
             INPUT_W, INPUT_H, 
             final_left_wall, final_right_wall, 
             Y_START, Y_END, X_START, X_END, 
             OSC_Y_START, OSC_Y_END, OSC_X_START, OSC_X_END, 
             AMP_TRIGGER_THRESHOLD, PIN_ZONE_BIAS, OSC_BIAS, 
-            raw_stream 
+            raw_stream[idx] 
         ); 
-        cudaStreamSynchronize(raw_stream);
         auto t_post_end = std::chrono::high_resolution_clock::now();
-        double postprocess_ms = std::chrono::duration<double, std::milli>(t_post_end - t_post_start).count();
+        double post_ms = std::chrono::duration<double, std::milli>(t_post_end - t_post_start).count();
 
-        auto t_d2h_start = std::chrono::high_resolution_clock::now();
-        // STAGE 10: Host Pinned Extract DMA copy
-        cudaMemcpyAsync(h_anomaly.data, d_anomaly_map_final.data, OUTPUT_SIZE, cudaMemcpyDeviceToHost, raw_stream); 
-        stream.waitForCompletion(); // Sync point 2
-        auto t_d2h_end = std::chrono::high_resolution_clock::now();
-        double d2h_ms = std::chrono::duration<double, std::milli>(t_d2h_end - t_d2h_start).count();
+        cudaMemcpyAsync(h_anomaly[idx].data, d_anomaly_map_final[idx].data, OUTPUT_SIZE, cudaMemcpyDeviceToHost, raw_stream[idx]); 
 
-        // Accumulate timing matrix metrics
-        total_preprocess_ms += preprocess_ms;
-        total_h2d_ms += h2d_ms;
-        total_inference_ms += inference_ms;
-        total_postprocess_ms += postprocess_ms;
-        total_d2h_ms += d2h_ms;
+        inflight_meta[idx] = { job.filename, job.label, job.io_read_ms, preprocess_ms, h2d_ms, inference_ms, post_ms };
+        first_iterations[idx] = false;
 
-        // Global Max Score Evaluation Pass
-        double max_val; 
-        cv::minMaxLoc(h_anomaly, nullptr, &max_val); 
+        idx = !idx; 
+    } 
 
-        bool predicted_anomaly = (max_val > threshold);
-        std::string status_str = predicted_anomaly ? "FAIL" : "PASS";
+    std::cout << "DEBUG: Main loop broke! Draining pipeline trails..." << std::endl;
 
-        // Performance Statistics Grid Matching
-        if (job.label == 1) { // Ground Truth Anomaly
-            if (predicted_anomaly) true_positives++;
-            else false_negatives++;
-        } else { // Ground Truth Good
-            if (predicted_anomaly) false_positives++;
-            else true_negatives++;
-        }
-        total_processed++;
+    // ========================================================================
+    // CONCURRENT PIPELINE FLUSH BARRIER (Final Asymmetric Drain)
+    // ========================================================================
+    for (int final_slot = 0; final_slot < 2; ++final_slot) {
+        if (!first_iterations[final_slot]) {
+            auto t_d2h_start = std::chrono::high_resolution_clock::now();
+            stream[final_slot].waitForCompletion();
+            auto t_d2h_end = std::chrono::high_resolution_clock::now();
+            double d2h_ms = std::chrono::duration<double, std::milli>(t_d2h_end - t_d2h_start).count();
 
-        // Structured Inline JSON Telemetry Stream Logger
-        if (telemetry_log.is_open()) {
+            double max_val; 
+            cv::minMaxLoc(h_anomaly[final_slot], nullptr, &max_val); 
+
+            bool predicted_anomaly = (max_val > threshold);
+            std::string status_str = predicted_anomaly ? "FAIL" : "PASS";
+
+            if (inflight_meta[final_slot].label == 1) { 
+                if (predicted_anomaly) true_positives++;
+                else false_negatives++;
+            } else { 
+                if (predicted_anomaly) false_positives++;
+                else true_negatives++;
+            }
+            total_processed++;
+
+            {
+                std::lock_guard<std::mutex> lock(g_metrics_mutex);
+                g_preprocess_lats.push_back(inflight_meta[final_slot].preprocess_ms);
+                g_h2d_lats.push_back(inflight_meta[final_slot].h2d_ms);
+                g_inference_lats.push_back(inflight_meta[final_slot].inference_ms);
+                g_postprocess_lats.push_back(inflight_meta[final_slot].postprocess_ms);
+                g_d2h_lats.push_back(d2h_ms);
+            }
+
             size_t free_mem = 0, total_mem = 0;
             cudaMemGetInfo(&free_mem, &total_mem);
             double vram_free_mb = static_cast<double>(free_mem) / (1024.0 * 1024.0);
 
-            telemetry_log << "{\"timestamp\":\"" << get_iso_timestamp() 
-                          << "\",\"board_id\":\"" << job.filename 
-                          << "\",\"status\":\"" << status_str 
-                          << "\",\"preprocess_ms\":" << preprocess_ms
-                          << ",\"h2d_ms\":" << h2d_ms 
-                          << ",\"exec_ms\":" << inference_ms 
-                          << ",\"postprocess_ms\":" << postprocess_ms
-                          << ",\"d2h_ms\":" << d2h_ms 
-                          << ",\"profile\":\"" << profile_str 
-                          << "\",\"vram_free_mb\":" << vram_free_mb << "}\n";
-        }
-
-        if (total_processed % 100 == 0) {
-            std::cout << "🚀 [LIVE] Boards Processed: " << total_processed << " | Mode: " << profile_str << std::endl;
-        }
-    } 
-
-    // ─── CHANGER 3: WAIT FOR ALL WORKERS AND SIGNAL FINISHED ───
-    for (auto& worker : producer_pool) {
-        if (worker.joinable()) {
-            worker.join();
-        }
-    }
-    // ─── FIXED CLEAN-UP TIMELINE ───
-   
-    ring_buffer.set_finished();
-
-    // 2. Safely join each worker thread exactly once
-    for (auto& worker : producer_pool) {
-        if (worker.joinable()) {
-            worker.join();
+            logger.log_event(inflight_meta[final_slot].filename, status_str, profile_str, 
+                             inflight_meta[final_slot].h2d_ms, inflight_meta[final_slot].inference_ms, d2h_ms, vram_free_mb);
         }
     }
 
-    if (telemetry_log.is_open()) telemetry_log.close();
+    // Force flush telemetry buffer to ensure zero drops on termination
+    logger.flush();
+
+    for (size_t i = 0; i < producer_pool.size(); ++i) {
+        if (producer_pool[i].joinable()) {
+            producer_pool[i].join();
+        }
+    }
+    std::cout << "DEBUG: All threads successfully dissolved." << std::endl;
 
     auto pipeline_end_time = std::chrono::high_resolution_clock::now();
     double total_wall_time_s = std::chrono::duration<double>(pipeline_end_time - pipeline_start_time).count();
 
-    // --- CONSOLIDATED PERFORMANCE STATS EVALUATION ---
+    // --- QUANTILE ACCUMULATOR MATH COMPILER FOR REPORT ---
+    auto compute_stats = [](const std::vector<double>& v, double& avg, double& max_val) {
+        if (v.empty()) { avg = 0.0; max_val = 0.0; return; }
+        avg = std::accumulate(v.begin(), v.end(), 0.0) / v.size();
+        max_val = *std::max_element(v.begin(), v.end());
+    };
+
+    double io_avg, io_max, pre_avg, pre_max, h2d_avg, h2d_max, inf_avg, inf_max, post_avg, post_max, d2h_avg, d2h_max;
+    compute_stats(g_io_read_lats, io_avg, io_max);
+    compute_stats(g_preprocess_lats, pre_avg, pre_max);
+    compute_stats(g_h2d_lats, h2d_avg, h2d_max);
+    compute_stats(g_inference_lats, inf_avg, inf_max);
+    compute_stats(g_postprocess_lats, post_avg, post_max);
+    compute_stats(g_d2h_lats, d2h_avg, d2h_max);
+
     double accuracy = total_processed > 0 ? static_cast<double>(true_positives + true_negatives) / total_processed : 0.0;
     double precision = (true_positives + false_positives) > 0 ? static_cast<double>(true_positives) / (true_positives + false_positives) : 0.0;
     double recall = (true_positives + false_negatives) > 0 ? static_cast<double>(true_positives) / (true_positives + false_negatives) : 0.0;
     double throughput = total_processed > 0 ? static_cast<double>(total_processed) / total_wall_time_s : 0.0;
-    
-    double avg_latency_ms = total_processed > 0 ? 
-        (total_preprocess_ms + total_h2d_ms + total_inference_ms + total_postprocess_ms + total_d2h_ms) / total_processed : 0.0;
 
+    // --- CONSOLIDATED HIGH-FIDELITY PERFORMANCE REPORT EXTRACTION ---
     std::cout << "\n" << std::string(65, '=') << "\n";
     std::cout << "               STAGEWISE LATENCY EVALUATION REPORT\n";
     std::cout << std::string(65, '-') << "\n";
-    if (total_processed > 0) {
-        std::cout << std::left << std::setw(25) << "CPU_PREPROCESS"   << " | " << std::setw(20) << (total_preprocess_ms / total_processed)  << " ms\n";
-        std::cout << std::left << std::setw(25) << "GPU_H2D_TRANSFER"  << " | " << std::setw(20) << (total_h2d_ms / total_processed)         << " ms\n";
-        std::cout << std::left << std::setw(25) << "GPU_EXECUTION"     << " | " << std::setw(20) << (total_inference_ms / total_processed)   << " ms\n";
-        std::cout << std::left << std::setw(25) << "GPU_POSTPROCESS"   << " | " << std::setw(20) << (total_postprocess_ms / total_processed) << " ms\n";
-        std::cout << std::left << std::setw(25) << "GPU_D2H_TRANSFER"  << " | " << std::setw(20) << (total_d2h_ms / total_processed)         << " ms\n";
-    }
+    std::cout << std::left << std::setw(25) << "STAGE" << " | " << std::setw(20) << "AVG LATENCY (ms)" << " | " << std::setw(10) << "MAX (ms)" << "\n";
+    std::cout << std::string(65, '-') << "\n";
+    std::cout << std::left << std::setw(25) << "IO_DISK_READ" << " | " << std::setw(20) << io_avg << " | " << std::setw(10) << io_max << "\n";
+    std::cout << std::left << std::setw(25) << "CPU_PREPROCESS_WARP" << " | " << std::setw(20) << pre_avg << " | " << std::setw(10) << pre_max << " (Overlap Active)\n";
+    std::cout << std::left << std::setw(25) << "GPU_H2D_TRANSFER" << " | " << std::setw(20) << h2d_avg << " | " << std::setw(10) << h2d_max << "\n";
+    std::cout << std::left << std::setw(25) << "GPU_ENGINE_EXECUTION" << " | " << std::setw(20) << inf_avg << " | " << std::setw(10) << inf_max << "\n";
+    std::cout << std::left << std::setw(25) << "GPU_POSTPROCESS_MASK" << " | " << std::setw(20) << post_avg << " | " << std::setw(10) << post_max << "\n";
+    std::cout << std::left << std::setw(25) << "GPU_D2H_TRANSFER" << " | " << std::setw(20) << d2h_avg << " | " << std::setw(10) << d2h_max << "\n";
     std::cout << std::string(65, '=') << "\n\n";
 
     std::cout << "========================================\n";
@@ -538,13 +707,13 @@ int main() {
     std::cout << "Precision:  " << std::fixed << std::setprecision(4) << precision << "\n";
     std::cout << "Recall:     " << std::fixed << std::setprecision(4) << recall << "\n";
     std::cout << "Throughput: " << std::fixed << std::setprecision(2) << throughput << " FPS\n";
-    std::cout << "Avg Latency:" << std::fixed << std::setprecision(2) << avg_latency_ms << " ms\n";
     std::cout << "========================================\n";
 
-    // Clean up allocated assets 
-    cudaFree(buffers[0]); 
-    cudaFree(buffers[1]); 
-    cudaFreeHost(h_output_pinned); 
+    // Assets Deallocation
+    cudaFree(buffers[0][0]); cudaFree(buffers[0][1]);
+    cudaFree(buffers[1][0]); cudaFree(buffers[1][1]);
+    cudaFreeHost(h_output_pinned[0]); 
+    cudaFreeHost(h_output_pinned[1]); 
     delete context;  
     delete engine;  
     delete runtime; 
