@@ -128,6 +128,21 @@ while preserving validation parity with the original Python implementation.
 
 ---
 
+# Profiling & Verification
+
+The asynchronous inference pipeline was profiled and validated using NVIDIA Nsight Systems.
+
+Verified behaviors:
+- CUDA stream overlap
+- Concurrent H2D/D2H transfers
+- GPU kernel concurrency
+- Double-buffered execution scheduling
+- Pipeline stage overlap efficiency
+
+Nsight traces are included in the repository for performance verification and latency analysis.
+```
+---
+
 # Dataset
 
 The model was trained and validated on the VisA Dataset — PCB1 subset.

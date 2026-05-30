@@ -34,3 +34,20 @@ target_link_libraries(pre ${OpenCV_LIBS} ${CUDA_LIBRARIES} ${NVINFER})
 add_executable(engine engine.cpp)
 target_include_directories(engine PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES} ${NVINFER_INCLUDE_DIR})
 target_link_libraries(engine cuda_kernels ${OpenCV_LIBS} ${NVINFER_LIB} cuda cudart)
+
+# ==========================================
+# TARGET: OPCUA (Your Main Script)
+# ==========================================
+add_executable(opcUa opcUa.cpp)
+
+# Map dynamic include targets (including modern NVTX v3 headers from the toolkit)
+target_include_directories(opcUa PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES} ${NVINFER_INCLUDE_DIR})
+
+# Link exactly what your script requires (linking to object library kernels + core deps)
+target_link_libraries(opcUa PRIVATE 
+    cuda_kernels 
+    cudart 
+    ${NVINFER_LIB} 
+    ${OpenCV_LIBS}
+    ${OPEN62541_LIB}
+)

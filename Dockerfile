@@ -59,6 +59,20 @@ RUN cmake -D CMAKE_BUILD_TYPE=RELEASE \
     make install && \
     ldconfig
 
+# 3. Build open62541 (OPC UA C/C++ Stack) from Source
+WORKDIR /opt
+RUN git clone --depth 1 -b v1.3.11 https://github.com/open62541/open62541.git
+
+WORKDIR /opt/open62541/build
+RUN cmake -D CMAKE_BUILD_TYPE=RELEASE \
+          -D CMAKE_INSTALL_PREFIX=/usr/local \
+          -D UA_ENABLE_AMALGAMATION=ON \
+          -D UA_ENABLE_MULTITHREADING=ON \
+          .. && \
+    make -j$(nproc) && \
+    make install && \
+    ldconfig
+
 WORKDIR /app
 COPY requirements.txt .
 RUN pip3 install --upgrade pip

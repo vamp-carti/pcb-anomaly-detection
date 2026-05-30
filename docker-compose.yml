@@ -7,6 +7,9 @@ services:
     image: smart-cv-layers:dev
     container_name: smart_cv_dev
     shm_size: '8gb'
+    network_mode: "host"
+    ipc: "host"
+    pid: "host"
     volumes:
       - .:/app
       - ${SSH_AUTH_SOCK}:/run/ssh-agent # Maps your host's SSH socket
