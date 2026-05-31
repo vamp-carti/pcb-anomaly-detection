@@ -58,8 +58,8 @@ The production engine executes as a synchronized, state-driven loop tied directl
                    ▼ (Atomic Registers Flush)
 ┌──────────────────────────────────────┐
 │   Rejection Gate + Async Telemetry   │
-└──────────────────────────────────────┘```
-
+└──────────────────────────────────────┘
+```
 1. Edge-Inbound Networking
 - **Reactive Idle Processing:** The engine spins down to 0% active CPU usage, sleeping on an atomic network latch waiting for an industrial client event.
 - **Native OPC UA Variable Mapping:** Directly exposes system registers (`InspectionTrigger`, `InspectionResult`, `AnomalyScore`, `Heartbeat`, `IndustrialProfile`, `SystemFaultCode`) over standard loopback port `4840`.
@@ -99,7 +99,7 @@ The system enforces standardized industrial status codes across the network name
 STATUS_PASS        = 0  // Board within nominal validation tolerance
 STATUS_FAIL        = 1  // Defect anomaly localized by engine
 STATUS_MECH_ERROR  = 2  // Alignment/geometry failure caught by gateway
-
+```
 
 Operational deployment profiles:
 
@@ -107,8 +107,8 @@ Operational deployment profiles:
 PROFILE_SAFETY     = 10 // Threshold: -0.3200f
 PROFILE_BALANCED   = 20 // Threshold: -0.2500f
 PROFILE_UPTIME     = 30 // Threshold: -0.1500f
+```
 
-```markdown
 # 🐳 Deployment & Multi-Stage Orchestration
 
 The system uses a hardened, multi-stage Docker production pattern to ensure reproducible, zero-dependency deployments on edge hardware.
@@ -130,8 +130,8 @@ docker container prune -f
 # Build and run the multi-stage C++ engine
 docker compose build cv-production
 docker compose up cv-production
+```
 
-```markdown
 # 🛠️ Tech Stack
 
 - **Languages:** ISO C++17, Native CUDA (NVIDIA NVCC)
