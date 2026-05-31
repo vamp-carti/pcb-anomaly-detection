@@ -58,7 +58,7 @@ The production engine executes as a synchronized, state-driven loop tied directl
                    ▼ (Atomic Registers Flush)
 ┌──────────────────────────────────────┐
 │   Rejection Gate + Async Telemetry   │
-└──────────────────────────────────────┘
+└──────────────────────────────────────┘```
 
 1. Edge-Inbound Networking
 - **Reactive Idle Processing:** The engine spins down to 0% active CPU usage, sleeping on an atomic network latch waiting for an industrial client event.
