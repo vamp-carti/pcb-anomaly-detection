@@ -1,9 +1,14 @@
+version: '3.8'
+
 services:
+  # ==========================================
+  # DEVELOPMENT INTERACTIVE SANDBOX
+  # ==========================================
   cv-dev:
     build:
       context: .
       dockerfile: Dockerfile
-      target: development
+      target: builder # Targets the stage with build tools and dependencies
     image: smart-cv-layers:dev
     container_name: smart_cv_dev
     shm_size: '8gb'
@@ -12,9 +17,9 @@ services:
     pid: "host"
     volumes:
       - .:/app
-      - ${SSH_AUTH_SOCK}:/run/ssh-agent # Maps your host's SSH socket
+      - ${SSH_AUTH_SOCK}:/run/ssh-agent 
     environment:
-      - SSH_AUTH_SOCK=/run/ssh-agent    # Tells Git where to find the socket
+      - SSH_AUTH_SOCK=/run/ssh-agent    
     working_dir: /app
     stdin_open: true 
     tty: true
@@ -25,3 +30,42 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+
+  # ==========================================
+  # PRODUCTION HARDENED RUNTIME ENGINE
+  # ==========================================
+  cv-production:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production # Targets the stripped-down C++ binary stage
+    image: smart-cv-layers:production
+    container_name: smart_cv_production
+    restart: always # Automatically restarts the engine if the system reboots or crashes
+    shm_size: '4gb'
+    network_mode: "host" # Crucial for ultra-low latency native OPC UA networking
+    ipc: "host"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      # Mount host folders for runtime inputs and outputs (Adjust host paths as needed)
+      - ./models:/app/models                 # Maps your TensorRT engine folder
+      - /opt/factory/capture:/app/capture    # Maps where the physical camera drops live frames
+      - /var/log/pcb_engine:/app/logs        # Maps where JSON telemetry and error images write to
+    environment:
+      - MODEL_ENGINE_PATH=/app/models/pcb_fastflow_fp16.engine
+      - TELEMETRY_LOG_PATH=/app/logs/telemetry_production.json
+      - ERROR_DUMP_DIR=/app/logs/mechanical_errors/
+      - LIVE_CAPTURE_PATH=/app/capture/live_pcb.png
+      - DEPLOYMENT_PROFILE=20                # 10 = SAFETY, 20 = BALANCED, 30 = UPTIME
+      - OPC_UA_PORT=4840                     # The industrial port the PLC talks to
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m" # Prevents Docker container logs from filling up host storage
+        max-file: "3"

@@ -1,17 +1,42 @@
-# Data and Local results (Recursive ignore)
+# Data, Local Results, and Ingestion Targets (Recursive ignore)
 data/
 results/
 preprocessed_data/
 temp/
+capture/
+!capture/.gitkeep
 
-# Python artifacts
+# Local Telemetry and Industrial Log Target Folders
+logs/
+!logs/.gitkeep
+*.json
+*.jsonl
+*.log
+
+# Python Artifacts & Sandboxes
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
+.venv/
+venv/
+.env
 
-# Binaries & Weights
+# Binaries & AI Weights (Keeps the 17MB engine out of Git)
 *.ckpt
 *.onnx
 *.engine
 *.pt
-.venv/
+*.pth
+
+# C++ Compilation Side-Effects (Isolated CMAKE clutter)
+**/build/
+**/CMakeFiles/
+**/CMakeCache.txt
+**/*.cmake
+**/Makefile
+**/cmake_install.cmake
+
+# IDE Layout Configurations and OS Noise
+.vscode/
+.idea/
+.DS_Store

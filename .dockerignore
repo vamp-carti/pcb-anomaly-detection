@@ -3,14 +3,27 @@ data/
 results/
 preprocessed_data/
 temp/
+capture/
+logs/
 
 # Exclude git and python noise
 .git
+.gitignore
+.dockerignore
 __pycache__
 *.pyc
+.ipynb_checkpoints/
+.venv/
+venv/
 
-# Exclude large weights (Already in results/, but good to be safe)
+# Exclude large weights (Mounted via docker-compose volumes instead)
 *.ckpt
 *.onnx
 *.engine
 *.pt
+*.pth
+
+# Exclude local test compilation artifacts
+**/build/
+**/CMakeFiles/
+**/CMakeCache.txt
